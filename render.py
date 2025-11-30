@@ -75,7 +75,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
                 per_view_level_dict['{0:05d}_LOD{1:d}'.format(idx, cur_level) + ".png"] = visible_count.item()
 
     t = np.array(t_list[5:])
-    fps = 1.0 / t.mean()
+    fps = 0.0 if t.size == 0 else 1.0 / t.mean()
     print(f'Test FPS: \033[1;35m{fps:.5f}\033[0m')
 
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
