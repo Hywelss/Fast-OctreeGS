@@ -12,8 +12,50 @@ import torch
 from einops import repeat
 
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from gsplat import rasterization
 from scene.gaussian_model import GaussianModel
+
+def build_viewmat_from_camera(viewpoint_camera):
+    """
+    构建gsplat所需的viewmat矩阵 (world-to-camera)
+    Args:
+        viewpoint_camera: Camera对象，包含world_view_transform
+    Returns:
+        viewmats: [1, 4, 4] tensor, world-to-camera变换矩阵
+    """
+    # world_view_transform已经是world-to-camera，但需要转置回来
+    # 因为Octree-GS中存储的是转置后的版本
+    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1)
+    return viewmat.unsqueeze(0)  # [1, 4, 4]
+
+def build_K_matrix(viewpoint_camera):
+    """
+    构建gsplat所需的相机内参矩阵K
+    Args:
+        viewpoint_camera: Camera对象，包含FoVx, FoVy, image_width, image_height
+    Returns:
+        Ks: [1, 3, 3] tensor, 相机内参矩阵
+    """
+    # 从FoV计算焦距
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    
+    focal_x = viewpoint_camera.image_width / (2.0 * tanfovx)
+    focal_y = viewpoint_camera.image_height / (2.0 * tanfovy)
+    
+    # 主点通常在图像中心
+    cx = viewpoint_camera.image_width / 2.0
+    cy = viewpoint_camera.image_height / 2.0
+    
+    # 构建K矩阵
+    K = torch.tensor([
+        [focal_x, 0.0, cx],
+        [0.0, focal_y, cy],
+        [0.0, 0.0, 1.0]
+    ], dtype=torch.float32, device="cuda")
+    
+    return K.unsqueeze(0)  # [1, 3, 3]
+
 
 def build_rotation(r):
     norm = torch.sqrt(
@@ -154,7 +196,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier=1.0, visible_mask=None, retain_grad=False, ape_code=-1):
     """
-    Render the scene. 
+    Render the scene using gsplat backend.
     
     Background tensor (bg_color) must be on GPU!
     """
@@ -174,43 +216,84 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         except:
             pass
 
-    # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=1,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=pipe.debug
-    )
-
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    # 构建gsplat所需的相机参数
+    viewmats = build_viewmat_from_camera(viewpoint_camera)
+    Ks = build_K_matrix(viewpoint_camera)
     
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii = rasterizer(
-        means3D = xyz,
-        means2D = screenspace_points,
-        shs = None,
-        colors_precomp = color,
-        opacities = opacity,
-        scales = scaling,
-        rotations = rot,
-        cov3D_precomp = None)
+    # 准备gsplat所需的参数
+    width = int(viewpoint_camera.image_width)
+    height = int(viewpoint_camera.image_height)
+    
+    # 调整scales以应用scaling_modifier
+    scales = scaling * scaling_modifier
+    
+    # 转换四元数为gsplat格式 (wxyz)
+    # Octree-GS使用的rotation_activation已经输出wxyz格式的四元数
+    quats = rot
+    
+    # 调用gsplat.rasterization
+    # 使用packed=True模式以优化内存使用
+    render_colors, render_alphas, meta = rasterization(
+        means=xyz,                    # [N, 3]
+        quats=quats,                  # [N, 4] wxyz
+        scales=scales,                # [N, 3]
+        opacities=opacity.squeeze(-1), # [N]
+        colors=color,                 # [N, 3]
+        viewmats=viewmats,            # [1, 4, 4]
+        Ks=Ks,                        # [1, 3, 3]
+        width=width,
+        height=height,
+        packed=True,                  # 使用packed模式优化内存
+        backgrounds=bg_color.unsqueeze(0).unsqueeze(0).unsqueeze(0),  # [1, 1, 1, 3]
+    )
+    
+    # 提取渲染结果
+    # render_colors shape: [1, height, width, 3]
+    # 转换为 [3, height, width] 格式以匹配原始输出
+    rendered_image = render_colors[0].permute(2, 0, 1)  # [3, H, W]
+    
+    # 从meta中提取radii信息
+    # gsplat返回的radii shape: [C, N] 或稀疏格式
+    radii = meta.get("radii", torch.zeros(xyz.shape[0], dtype=torch.int32, device="cuda"))
+    if radii.dim() > 1:
+        radii = radii[0]  # 取第一个相机的radii
+    
+    # 创建visibility filter
+    # gsplat在packed模式下会返回gaussian_ids，指示哪些高斯是可见的
+    if "gaussian_ids" in meta and meta["gaussian_ids"] is not None:
+        # packed模式：需要从sparse到dense
+        gaussian_ids = meta["gaussian_ids"]
+        if gaussian_ids.dim() > 1:
+            gaussian_ids = gaussian_ids[0]  # [M] M是可见高斯数量
+        
+        # 创建visibility filter
+        visibility_filter = torch.zeros(xyz.shape[0], dtype=torch.bool, device="cuda")
+        visibility_filter[gaussian_ids] = True
+        
+        # 更新radii为完整版本
+        radii_full = torch.zeros(xyz.shape[0], dtype=radii.dtype, device="cuda")
+        if radii.numel() > 0:
+            radii_full[gaussian_ids] = radii[:len(gaussian_ids)]
+        radii = radii_full
+    else:
+        # 非packed模式或fallback
+        visibility_filter = radii > 0
+    
+    # 使用meta中的means2d作为screenspace_points（如果需要梯度）
+    if "means2d" in meta and meta["means2d"] is not None:
+        means2d = meta["means2d"]
+        if means2d.dim() > 2:
+            means2d = means2d[0]  # [N, 2]
+        # 将2D坐标扩展到3D以匹配原始screenspace_points格式
+        # 注意：gsplat的means2d已经包含了梯度计算
+        if screenspace_points.shape[0] == means2d.shape[0]:
+            screenspace_points[:, :2] = means2d
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
+                "visibility_filter" : visibility_filter,
                 "radii": radii,
                 "selection_mask": mask,
                 "neural_opacity": neural_opacity,
@@ -219,56 +302,96 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
+                "visibility_filter" : visibility_filter,
                 "radii": radii,
                 }
 
 
 def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
-    Render the scene. 
+    Prefilter voxels using gsplat rasterization for visibility culling.
     
     Background tensor (bg_color) must be on GPU!
     """
 
-    # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=1,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=pipe.debug
-    )
-
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    # 获取被anchor_mask选中的anchor点
     means3D = pc.get_anchor[pc._anchor_mask]
-
-    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-    # scaling / rotation by the rasterizer.
-    scales = None
-    rotations = None
-    cov3D_precomp = None
+    
+    # 获取scales和rotations
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        # 如果需要预计算协方差矩阵，使用cov3D
+        # 注意：gsplat也支持直接传入cov3D矩阵
+        scales = pc.get_scaling[pc._anchor_mask]
+        rotations = pc.get_rotation[pc._anchor_mask]
+        # 暂时不使用预计算的协方差，因为gsplat更喜欢scales+quats
     else:
         scales = pc.get_scaling[pc._anchor_mask]
         rotations = pc.get_rotation[pc._anchor_mask]
-
-    radii_pure = rasterizer.visible_filter(means3D = means3D,
-        scales = scales[:,:3],
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
     
-    visible_mask = pc._anchor_mask.clone()
-    visible_mask[pc._anchor_mask] = radii_pure > 0
+    # 调整scales
+    scales = scales[:, :3] * scaling_modifier
+    
+    # 构建gsplat所需的相机参数
+    viewmats = build_viewmat_from_camera(viewpoint_camera)
+    Ks = build_K_matrix(viewpoint_camera)
+    
+    width = int(viewpoint_camera.image_width)
+    height = int(viewpoint_camera.image_height)
+    
+    # 创建虚拟的opacities和colors（仅用于可见性检测）
+    opacities = torch.ones(means3D.shape[0], device="cuda")
+    colors = torch.ones(means3D.shape[0], 3, device="cuda")
+    
+    # 调用gsplat.rasterization进行可见性过滤
+    # 使用packed=True可以直接获取可见高斯的IDs
+    try:
+        _, _, meta = rasterization(
+            means=means3D,
+            quats=rotations,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            viewmats=viewmats,
+            Ks=Ks,
+            width=width,
+            height=height,
+            packed=True,
+            backgrounds=bg_color.unsqueeze(0).unsqueeze(0).unsqueeze(0),
+            render_mode="RGB",  # 只需要基本渲染模式
+        )
+        
+        # 从meta中提取可见的gaussian_ids
+        if "gaussian_ids" in meta and meta["gaussian_ids"] is not None:
+            gaussian_ids = meta["gaussian_ids"]
+            if gaussian_ids.dim() > 1:
+                gaussian_ids = gaussian_ids[0]
+            
+            # 创建visible_mask
+            # 首先克隆原始的anchor_mask
+            visible_mask = pc._anchor_mask.clone()
+            
+            # 创建临时mask标记哪些被_anchor_mask选中的anchor是可见的
+            temp_visible = torch.zeros(means3D.shape[0], dtype=torch.bool, device="cuda")
+            temp_visible[gaussian_ids] = True
+            
+            # 更新visible_mask
+            visible_mask[pc._anchor_mask] = temp_visible
+        else:
+            # 如果没有gaussian_ids，使用radii作为fallback
+            radii = meta.get("radii", None)
+            if radii is not None:
+                if radii.dim() > 1:
+                    radii = radii[0]
+                visible_mask = pc._anchor_mask.clone()
+                visible_mask[pc._anchor_mask] = radii > 0
+            else:
+                # 最坏情况：保持原始mask
+                visible_mask = pc._anchor_mask.clone()
+                
+    except Exception as e:
+        # 如果gsplat调用失败，fallback到保守策略
+        print(f"Warning: gsplat prefilter failed with error: {e}, using conservative mask")
+        visible_mask = pc._anchor_mask.clone()
+    
     return visible_mask
+
