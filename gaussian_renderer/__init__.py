@@ -8,11 +8,13 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+import math
+
+import gsplat
 import torch
 from einops import repeat
+from typing import Tuple
 
-import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 
 def build_rotation(r):
@@ -152,76 +154,94 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         return xyz, color, opacity, scaling, rot
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier=1.0, visible_mask=None, retain_grad=False, ape_code=-1):
+def _camera_matrices(viewpoint_camera: object) -> Tuple[torch.Tensor, torch.Tensor]:
+    fx = 0.5 * viewpoint_camera.image_width / math.tan(viewpoint_camera.FoVx * 0.5)
+    fy = 0.5 * viewpoint_camera.image_height / math.tan(viewpoint_camera.FoVy * 0.5)
+    cx = viewpoint_camera.image_width * 0.5
+    cy = viewpoint_camera.image_height * 0.5
+
+    intrinsic = torch.tensor(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    viewmat = viewpoint_camera.world_view_transform
+    return intrinsic, viewmat
+
+
+def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, visible_mask=None, retain_grad=False, ape_code=-1):
     """
-    Render the scene. 
-    
+    Render the scene with the Gsplat backend.
+
     Background tensor (bg_color) must be on GPU!
     """
 
     is_training = pc.get_color_mlp.training
-        
-    if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    else:
-        xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, ape_code=ape_code)
 
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
+    if is_training:
+        xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(
+            viewpoint_camera, pc, visible_mask, is_training=is_training
+        )
+    else:
+        xyz, color, opacity, scaling, rot = generate_neural_gaussians(
+            viewpoint_camera, pc, visible_mask, is_training=is_training, ape_code=ape_code
+        )
+
+    intrinsic, viewmat = _camera_matrices(viewpoint_camera)
+
+    batch_offsets = torch.tensor([0, xyz.shape[0]], device=xyz.device, dtype=torch.int32)
+    backgrounds = bg_color.view(1, 3)
+    viewmats = viewmat.unsqueeze(0)
+    intrinsics = intrinsic.unsqueeze(0)
+
+    rendered_image, _, info = gsplat.rasterization(
+        means3d=xyz,
+        opacities=opacity,
+        scales=scaling * scaling_modifier,
+        rotations=rot,
+        colors=color,
+        shs=None,
+        viewmats=viewmats,
+        Ks=intrinsics,
+        width=int(viewpoint_camera.image_width),
+        height=int(viewpoint_camera.image_height),
+        packed=True,
+        batch_offsets=batch_offsets,
+        backgrounds=backgrounds,
+    )
+
+    if rendered_image.dim() == 4:
+        rendered_image = rendered_image.permute(0, 3, 1, 2)
+    if rendered_image.dim() == 4:
+        rendered_image = rendered_image[0]
+
+    screenspace_points = info["means2d"].squeeze(0)
     if retain_grad:
         try:
             screenspace_points.retain_grad()
-        except:
+        except Exception:
             pass
 
-    # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    radii = info["radii"].squeeze(0)
+    visibility = radii > 0
 
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=1,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=pipe.debug
-    )
-
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-    
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii = rasterizer(
-        means3D = xyz,
-        means2D = screenspace_points,
-        shs = None,
-        colors_precomp = color,
-        opacities = opacity,
-        scales = scaling,
-        rotations = rot,
-        cov3D_precomp = None)
-
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:
-        return {"render": rendered_image,
-                "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
-                "radii": radii,
-                "selection_mask": mask,
-                "neural_opacity": neural_opacity,
-                "scaling": scaling,
-                }
+        return {
+            "render": rendered_image,
+            "viewspace_points": screenspace_points,
+            "visibility_filter": visibility,
+            "radii": radii,
+            "selection_mask": mask,
+            "neural_opacity": neural_opacity,
+            "scaling": scaling,
+        }
     else:
-        return {"render": rendered_image,
-                "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
-                "radii": radii,
-                }
+        return {
+            "render": rendered_image,
+            "viewspace_points": screenspace_points,
+            "visibility_filter": visibility,
+            "radii": radii,
+        }
 
 
 def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
@@ -231,44 +251,18 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
     Background tensor (bg_color) must be on GPU!
     """
 
-    # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=1,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=pipe.debug
-    )
-
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     means3D = pc.get_anchor[pc._anchor_mask]
 
-    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-    # scaling / rotation by the rasterizer.
-    scales = None
-    rotations = None
-    cov3D_precomp = None
-    if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
-    else:
-        scales = pc.get_scaling[pc._anchor_mask]
-        rotations = pc.get_rotation[pc._anchor_mask]
+    homo = torch.cat([means3D, torch.ones_like(means3D[:, :1])], dim=1)
+    clip = homo @ viewpoint_camera.full_proj_transform
+    ndc = clip[:, :3] / clip[:, 3:4].clamp(min=1e-8)
+    in_frustum = (
+        (ndc[:, 0].abs() <= 1.0)
+        & (ndc[:, 1].abs() <= 1.0)
+        & (ndc[:, 2] >= -1.0)
+        & (ndc[:, 2] <= 1.0)
+    )
 
-    radii_pure = rasterizer.visible_filter(means3D = means3D,
-        scales = scales[:,:3],
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
-    
     visible_mask = pc._anchor_mask.clone()
-    visible_mask[pc._anchor_mask] = radii_pure > 0
+    visible_mask[pc._anchor_mask] = in_frustum
     return visible_mask

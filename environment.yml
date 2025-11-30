@@ -22,5 +22,6 @@ dependencies:
     - jaxtyping
     - colorama
     - opencv-python
+    - gsplat
     - submodules/diff-gaussian-rasterization
     - submodules/simple-knn
