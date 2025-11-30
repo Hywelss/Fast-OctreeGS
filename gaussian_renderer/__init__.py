@@ -189,10 +189,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
 
     intrinsic, viewmat = _camera_matrices(viewpoint_camera)
 
-    viewmats = viewmat.unsqueeze(0).unsqueeze(0)
-    intrinsics = intrinsic.unsqueeze(0).unsqueeze(0)
-    backgrounds = bg_color.view(1, 1, 1, 1, 3).expand(
-        *viewmats.shape[:-2], int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 3
+    viewmats = viewmat.unsqueeze(0)
+    intrinsics = intrinsic.unsqueeze(0)
+    backgrounds = bg_color.view(1, 1, 1, 3).expand(
+        viewmats.shape[0], int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 3
     )
 
     rendered_image, _, info = gsplat.rasterization(
