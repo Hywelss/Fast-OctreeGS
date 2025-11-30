@@ -8,20 +8,39 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+import importlib
+import math
+
 import torch
 from einops import repeat
 
-import math
 
-try:
-    from gsplat.cuda import rasterization as _gs_rasterization
+def _load_gsplat_backend():
+    """Resolve the gsplat rasterization backend across known module paths."""
 
-    GaussianRasterizationSettings = _gs_rasterization.GaussianRasterizationSettings
-    GaussianRasterizer = _gs_rasterization.GaussianRasterizer
-except Exception as exc:  # pragma: no cover - raises when gsplat is missing
+    candidate_modules = [
+        "gsplat.cuda.rasterization",
+        "gsplat.render.rasterization",
+        "gsplat.rasterization",
+    ]
+
+    for module_path in candidate_modules:
+        spec = importlib.util.find_spec(module_path)
+        if spec is None:
+            continue
+
+        module = importlib.import_module(module_path)
+        settings = getattr(module, "GaussianRasterizationSettings", None)
+        rasterizer = getattr(module, "GaussianRasterizer", None)
+        if settings is not None and rasterizer is not None:
+            return settings, rasterizer
+
     raise ImportError(
         "Gsplat is required as the rendering backend. Please install the 'gsplat' pip package."
-    ) from exc
+    )
+
+
+GaussianRasterizationSettings, GaussianRasterizer = _load_gsplat_backend()
 
 from scene.gaussian_model import GaussianModel
 
