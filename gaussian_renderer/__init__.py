@@ -195,7 +195,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     intrinsics = intrinsic.unsqueeze(0)
 
     rendered_image, _, info = gsplat.rasterization(
-        means3d=xyz,
+        means=xyz,
         opacities=opacity,
         scales=scaling * scaling_modifier,
         rotations=rot,
