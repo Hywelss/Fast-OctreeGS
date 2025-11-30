@@ -14,7 +14,10 @@ from einops import repeat
 import math
 
 try:
-    from gsplat.cuda import GaussianRasterizationSettings, GaussianRasterizer
+    from gsplat.cuda import rasterization as _gs_rasterization
+
+    GaussianRasterizationSettings = _gs_rasterization.GaussianRasterizationSettings
+    GaussianRasterizer = _gs_rasterization.GaussianRasterizer
 except Exception as exc:  # pragma: no cover - raises when gsplat is missing
     raise ImportError(
         "Gsplat is required as the rendering backend. Please install the 'gsplat' pip package."
