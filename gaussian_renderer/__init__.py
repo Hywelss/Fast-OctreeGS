@@ -18,6 +18,24 @@ from einops import repeat
 def _load_gsplat_backend():
     """Resolve the gsplat rasterization backend across known module paths."""
 
+    def _maybe_from_module(module):
+        settings = getattr(module, "GaussianRasterizationSettings", None)
+        rasterizer = getattr(module, "GaussianRasterizer", None)
+        if settings is not None and rasterizer is not None:
+            return settings, rasterizer
+        return None
+
+    try:
+        import gsplat
+    except ModuleNotFoundError as exc:
+        raise ImportError(
+            "Gsplat is required as the rendering backend. Please install the 'gsplat' pip package."
+        ) from exc
+
+    direct = _maybe_from_module(gsplat)
+    if direct is not None:
+        return direct
+
     candidate_modules = [
         "gsplat.cuda.rasterization",
         "gsplat.render.rasterization",
@@ -25,15 +43,22 @@ def _load_gsplat_backend():
     ]
 
     for module_path in candidate_modules:
-        spec = importlib.util.find_spec(module_path)
+        try:
+            spec = importlib.util.find_spec(module_path)
+        except ModuleNotFoundError:
+            continue
+
         if spec is None:
             continue
 
-        module = importlib.import_module(module_path)
-        settings = getattr(module, "GaussianRasterizationSettings", None)
-        rasterizer = getattr(module, "GaussianRasterizer", None)
-        if settings is not None and rasterizer is not None:
-            return settings, rasterizer
+        try:
+            module = importlib.import_module(module_path)
+        except ModuleNotFoundError:
+            continue
+
+        resolved = _maybe_from_module(module)
+        if resolved is not None:
+            return resolved
 
     raise ImportError(
         "Gsplat is required as the rendering backend. Please install the 'gsplat' pip package."
