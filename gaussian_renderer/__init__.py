@@ -12,7 +12,14 @@ import torch
 from einops import repeat
 
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+
+try:
+    from gsplat.cuda import GaussianRasterizationSettings, GaussianRasterizer
+except Exception as exc:  # pragma: no cover - raises when gsplat is missing
+    raise ImportError(
+        "Gsplat is required as the rendering backend. Please install the 'gsplat' pip package."
+    ) from exc
+
 from scene.gaussian_model import GaussianModel
 
 def build_rotation(r):
@@ -166,6 +173,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, ape_code=ape_code)
 
+    # Ensure compact, contiguous tensors before handing off to the gsplat backend to
+    # minimize packing overhead on the GPU side.
+    xyz = xyz.contiguous()
+    color = color.contiguous()
+    opacity = opacity.contiguous()
+    scaling = scaling.contiguous()
+    rot = rot.contiguous()
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
     if retain_grad:
@@ -194,17 +209,24 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-    
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii = rasterizer(
-        means3D = xyz,
-        means2D = screenspace_points,
-        shs = None,
-        colors_precomp = color,
-        opacities = opacity,
-        scales = scaling,
-        rotations = rot,
-        cov3D_precomp = None)
+
+    rasterizer_kwargs = dict(
+        means3D=xyz,
+        means2D=screenspace_points,
+        shs=None,
+        colors_precomp=color,
+        opacities=opacity,
+        scales=scaling,
+        rotations=rot,
+        cov3D_precomp=None,
+    )
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    try:
+        rendered_image, radii = rasterizer(**rasterizer_kwargs, pack=True)
+    except TypeError:
+        # Fallback for older gsplat builds that may not expose the pack flag.
+        rendered_image, radii = rasterizer(**rasterizer_kwargs)
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:
@@ -251,7 +273,7 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-    means3D = pc.get_anchor[pc._anchor_mask]
+    means3D = pc.get_anchor[pc._anchor_mask].contiguous()
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -264,10 +286,15 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
         scales = pc.get_scaling[pc._anchor_mask]
         rotations = pc.get_rotation[pc._anchor_mask]
 
-    radii_pure = rasterizer.visible_filter(means3D = means3D,
-        scales = scales[:,:3],
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
+    scale_input = None if scales is None else scales[:, :3].contiguous()
+    rotation_input = None if rotations is None else rotations.contiguous()
+
+    radii_pure = rasterizer.visible_filter(
+        means3D=means3D,
+        scales=scale_input,
+        rotations=rotation_input,
+        cov3D_precomp=cov3D_precomp,
+    )
     
     visible_mask = pc._anchor_mask.clone()
     visible_mask[pc._anchor_mask] = radii_pure > 0
